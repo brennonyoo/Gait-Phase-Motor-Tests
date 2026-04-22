@@ -22,8 +22,8 @@ volatile float targetSPS = 0.0f;
 
 constexpr long MIN_STEPS = 0;
 constexpr long MAX_STEPS = 1200;
+constexpr float STEPS_PER_DEG = 10.0f;
 
-//Gait/state labels
 enum GaitPhase {
   PHASE_STANCE_LOADING,
   PHASE_MID_STANCE,
@@ -43,17 +43,22 @@ struct SensorData {
 
 struct PhaseOutput {
   GaitPhase phase;
-  float theoreticalKneeAngleDeg;  // bench target only
+  float theoreticalKneeAngleDeg;
 };
 
-// IMU placeholders 
+struct MotorTestCommand {
+  long targetStepPosition;
+  float speedSPS;
+  const char* modeLabel;
+};
+
 unsigned long lastSampleMs = 0;
 float lastAngleDeg = 0.0f;
 
-constexpr float STEPS_PER_DEG = 10.0f;
-
 float filteredLoad = 0.0f;
 constexpr float LOAD_ALPHA = 0.15f;
+
+GaitPhase lastPhase = PHASE_UNKNOWN;
 
 void stepISR() {
   if (!steppingEnabled) return;
@@ -71,7 +76,6 @@ void stepISR() {
   stepState = !stepState;
   digitalWriteFast(STEP_N_PIN, stepState ? HIGH : LOW);
 
-  // Counts one step only on rising edge
   if (stepState) {
     if (currentDirForward) {
       currentSteps++;
@@ -102,9 +106,8 @@ void setSpeedSPS(float sps) {
     return;
   }
 
-  float isrFreq = sps * 2.0f;  // high + low toggle
+  float isrFreq = sps * 2.0f;  
   uint32_t period_us = (uint32_t)(1e6f / isrFreq);
-
   stepTimer.begin(stepISR, period_us);
 }
 
@@ -132,16 +135,15 @@ void moveToSteps(long newTargetSteps, float sps) {
   setSpeedSPS(needMove ? sps : 0.0f);
 }
 
-float readMockShankAngleDeg() {
+float readMockShankAngleDeg() {  //Placeholder sensor stuff
   float t = millis() / 1000.0f;
   return 12.0f * sinf(2.0f * 3.14159f * 0.8f * t);
 }
 
 float readPressureNorm() {
-  int raw = analogRead(PRESSURE_PIN);           // 0..1023
+  int raw = analogRead(PRESSURE_PIN);  
   float norm = constrain(raw / 1023.0f, 0.0f, 1.0f);
 
-  //low-pass filter
   filteredLoad = LOAD_ALPHA * norm + (1.0f - LOAD_ALPHA) * filteredLoad;
   return filteredLoad;
 }
@@ -191,12 +193,13 @@ GaitPhase detectPhase(const SensorData& s) {
     if (s.shankAngleDeg < 4.0f)  return PHASE_MID_STANCE;
     return PHASE_TERMINAL_STANCE;
   }
+
   if (!loaded && s.footLoadNorm > 0.10f) {
     return PHASE_PRE_SWING;
   }
 
   if (unloading) {
-    if (shankForward && s.shankAngleDeg < 5.0f) return PHASE_INITIAL_SWING;
+    if (shankForward && s.shankAngleDeg < 5.0f)  return PHASE_INITIAL_SWING;
     if (shankForward && s.shankAngleDeg >= 5.0f) return PHASE_MID_SWING;
     if (shankBackward || s.shankVelDegPerSec <= 3.0f) return PHASE_TERMINAL_SWING;
   }
@@ -227,6 +230,67 @@ long angleDegToSteps(float angleDeg) {
   return constrain(steps, MIN_STEPS, MAX_STEPS);
 }
 
+MotorTestCommand buildMotorTestCommand(const PhaseOutput& out) {
+  MotorTestCommand cmd{};
+
+  switch (out.phase) {
+    case PHASE_STANCE_LOADING:
+      cmd.targetStepPosition = angleDegToSteps(10.0f);
+      cmd.speedSPS = 250.0f;
+      cmd.modeLabel = "LOAD_RESPONSE_TEST";
+      break;
+
+    case PHASE_MID_STANCE:
+      cmd.targetStepPosition = angleDegToSteps(5.0f);
+      cmd.speedSPS = 180.0f;
+      cmd.modeLabel = "MID_STANCE_HOLD_TEST";
+      break;
+
+    case PHASE_TERMINAL_STANCE:
+      cmd.targetStepPosition = angleDegToSteps(0.0f);
+      cmd.speedSPS = 220.0f;
+      cmd.modeLabel = "STANCE_EXTENSION_TEST";
+      break;
+
+    case PHASE_PRE_SWING:
+      cmd.targetStepPosition = angleDegToSteps(20.0f);
+      cmd.speedSPS = 350.0f;
+      cmd.modeLabel = "PRE_SWING_FLEX_TEST";
+      break;
+
+    case PHASE_INITIAL_SWING:
+      cmd.targetStepPosition = angleDegToSteps(40.0f);
+      cmd.speedSPS = 500.0f;
+      cmd.modeLabel = "INITIAL_SWING_DRIVE_TEST";
+      break;
+
+    case PHASE_MID_SWING:
+      cmd.targetStepPosition = angleDegToSteps(60.0f);
+      cmd.speedSPS = 550.0f;
+      cmd.modeLabel = "MID_SWING_PEAK_FLEX_TEST";
+      break;
+
+    case PHASE_TERMINAL_SWING:
+      cmd.targetStepPosition = angleDegToSteps(15.0f);
+      cmd.speedSPS = 300.0f;
+      cmd.modeLabel = "TERMINAL_SWING_RETURN_TEST";
+      break;
+
+    default:
+      cmd.targetStepPosition = angleDegToSteps(0.0f);
+      cmd.speedSPS = 120.0f;
+      cmd.modeLabel = "SAFE_HOME_TEST";
+      break;
+  }
+
+  return cmd;
+}
+
+void runMotorTestFromPhase(const PhaseOutput& out) {
+  MotorTestCommand cmd = buildMotorTestCommand(out);
+  moveToSteps(cmd.targetStepPosition, cmd.speedSPS);
+}
+
 void setup() {
   pinMode(PRESSURE_PIN, INPUT);
 
@@ -248,20 +312,27 @@ void setup() {
   lastSampleMs = millis();
   lastAngleDeg = 0.0f;
 
-  Serial.println("Bench sensor + motor integration started");
+  Serial.println("Bench gait-phase motor test started");
 }
 
 void loop() {
   SensorData s = readSensors();
   PhaseOutput out = computePhaseOutput(s);
-  long desiredSteps = angleDegToSteps(out.theoreticalKneeAngleDeg);
-  moveToSteps(desiredSteps, 400.0f);
+
+  runMotorTestFromPhase(out);
 
   long cs, ts;
   noInterrupts();
   cs = currentSteps;
   ts = targetSteps;
   interrupts();
+
+  MotorTestCommand activeCmd = buildMotorTestCommand(out);
+
+  if (out.phase != lastPhase) {
+    Serial.println("---- PHASE CHANGE ----");
+    lastPhase = out.phase;
+  }
 
   Serial.print("load=");
   Serial.print(s.footLoadNorm, 3);
@@ -271,8 +342,14 @@ void loop() {
   Serial.print(s.shankVelDegPerSec, 2);
   Serial.print(", phase=");
   Serial.print(phaseToString(out.phase));
+  Serial.print(", motorMode=");
+  Serial.print(activeCmd.modeLabel);
   Serial.print(", targetDeg=");
   Serial.print(out.theoreticalKneeAngleDeg, 1);
+  Serial.print(", cmdSteps=");
+  Serial.print(activeCmd.targetStepPosition);
+  Serial.print(", cmdSPS=");
+  Serial.print(activeCmd.speedSPS, 1);
   Serial.print(", currentSteps=");
   Serial.print(cs);
   Serial.print(", targetSteps=");
