@@ -24,6 +24,23 @@ constexpr long MIN_STEPS = 0;
 constexpr long MAX_STEPS = 1200;
 constexpr float STEPS_PER_DEG = 10.0f;
 
+// ---------------- SAFETY LIMITS ----------------
+
+constexpr float MAX_SAFE_KNEE_ANGLE_DEG = 70.0f;
+constexpr float MIN_SAFE_KNEE_ANGLE_DEG = 0.0f;
+
+constexpr float MAX_SAFE_SPEED_SPS = 600.0f;
+constexpr long MAX_SAFE_STEPS = (long)(MAX_SAFE_KNEE_ANGLE_DEG * STEPS_PER_DEG);
+
+//example values 
+constexpr int PRESSURE_ZERO_RAW = 120; 
+constexpr int PRESSURE_FULL_RAW = 820;  
+
+constexpr float WEIGHT_ZERO_RAW = 120.0f;
+constexpr float WEIGHT_SCALE_FACTOR = 0.10f; 
+
+volatile float userWeightKg = 0.0f;
+
 enum GaitPhase {
   PHASE_STANCE_LOADING,
   PHASE_MID_STANCE,
@@ -36,6 +53,7 @@ enum GaitPhase {
 };
 
 struct SensorData {
+  int pressureRaw;
   float footLoadNorm;
   float shankAngleDeg;
   float shankVelDegPerSec;
@@ -59,6 +77,7 @@ float filteredLoad = 0.0f;
 constexpr float LOAD_ALPHA = 0.15f;
 
 GaitPhase lastPhase = PHASE_UNKNOWN;
+
 
 void stepISR() {
   if (!steppingEnabled) return;
@@ -93,26 +112,45 @@ void setDirection(bool forward) {
   digitalWriteFast(DIR_N_PIN, forward ? DM_ON : DM_OFF);
 }
 
+void emergencyStop() {
+  noInterrupts();
+  steppingEnabled = false;
+  stepState = false;
+  interrupts();
+
+  stepTimer.end();
+  digitalWriteFast(STEP_N_PIN, LOW);
+  enableDriver(false);
+
+  Serial.println("EMERGENCY STOP TRIGGERED");
+}
+
 void setSpeedSPS(float sps) {
   targetSPS = sps;
 
   if (sps <= 0.0f) {
     stepTimer.end();
+
     noInterrupts();
     steppingEnabled = false;
     stepState = false;
     interrupts();
+
     digitalWriteFast(STEP_N_PIN, LOW);
     return;
   }
 
-  float isrFreq = sps * 2.0f;  
+  sps = constrain(sps, 0.0f, MAX_SAFE_SPEED_SPS);
+
+  float isrFreq = sps * 2.0f;
   uint32_t period_us = (uint32_t)(1e6f / isrFreq);
+
   stepTimer.begin(stepISR, period_us);
 }
 
 void moveToSteps(long newTargetSteps, float sps) {
-  newTargetSteps = constrain(newTargetSteps, MIN_STEPS, MAX_STEPS);
+  newTargetSteps = constrain(newTargetSteps, MIN_STEPS, MAX_SAFE_STEPS);
+  sps = constrain(sps, 0.0f, MAX_SAFE_SPEED_SPS);
 
   long cs;
   noInterrupts();
@@ -135,23 +173,69 @@ void moveToSteps(long newTargetSteps, float sps) {
   setSpeedSPS(needMove ? sps : 0.0f);
 }
 
-float readMockShankAngleDeg() {  //Placeholder sensor stuff
+float readMockShankAngleDeg() {
   float t = millis() / 1000.0f;
   return 12.0f * sinf(2.0f * 3.14159f * 0.8f * t);
 }
 
-float readPressureNorm() {
-  int raw = analogRead(PRESSURE_PIN);  
-  float norm = constrain(raw / 1023.0f, 0.0f, 1.0f);
+int readPressureRaw() {
+  return analogRead(PRESSURE_PIN);
+}
+
+float calibratePressureNorm(int raw) {
+  float norm = (float)(raw - PRESSURE_ZERO_RAW) /
+               (float)(PRESSURE_FULL_RAW - PRESSURE_ZERO_RAW);
+
+  return constrain(norm, 0.0f, 1.0f);
+}
+
+float readPressureNorm(int raw) {
+  float norm = calibratePressureNorm(raw);
 
   filteredLoad = LOAD_ALPHA * norm + (1.0f - LOAD_ALPHA) * filteredLoad;
+
   return filteredLoad;
+}
+
+float recordUserWeight() {
+  const int samples = 50;
+  float sum = 0.0f;
+
+  Serial.println("Stand still on the scale to record weight...");
+
+  while (calibratePressureNorm(readPressureRaw()) < 0.20f) {
+    delay(10);
+  }
+
+  delay(500);
+
+  for (int i = 0; i < samples; i++) {
+    sum += readPressureRaw();
+    delay(10);
+  }
+
+  float avgRaw = sum / samples;
+
+  float weightKg = (avgRaw - WEIGHT_ZERO_RAW) * WEIGHT_SCALE_FACTOR;
+
+  if (weightKg < 0.0f) {
+    weightKg = 0.0f;
+  }
+
+  Serial.print("Average raw pressure reading: ");
+  Serial.println(avgRaw);
+
+  Serial.print("Recorded user weight kg: ");
+  Serial.println(weightKg);
+
+  return weightKg;
 }
 
 SensorData readSensors() {
   SensorData s{};
 
-  s.footLoadNorm = readPressureNorm();
+  s.pressureRaw = readPressureRaw();
+  s.footLoadNorm = readPressureNorm(s.pressureRaw);
   s.shankAngleDeg = readMockShankAngleDeg();
 
   unsigned long now = millis();
@@ -168,6 +252,7 @@ SensorData readSensors() {
 
   return s;
 }
+
 
 const char* phaseToString(GaitPhase p) {
   switch (p) {
@@ -222,12 +307,29 @@ PhaseOutput computePhaseOutput(const SensorData& s) {
     default:                    out.theoreticalKneeAngleDeg = 0.0f;  break;
   }
 
+  out.theoreticalKneeAngleDeg = constrain(
+    out.theoreticalKneeAngleDeg,
+    MIN_SAFE_KNEE_ANGLE_DEG,
+    MAX_SAFE_KNEE_ANGLE_DEG
+  );
+
   return out;
 }
 
 long angleDegToSteps(float angleDeg) {
+  angleDeg = constrain(angleDeg, MIN_SAFE_KNEE_ANGLE_DEG, MAX_SAFE_KNEE_ANGLE_DEG);
+
   long steps = (long)(angleDeg * STEPS_PER_DEG);
-  return constrain(steps, MIN_STEPS, MAX_STEPS);
+
+  return constrain(steps, MIN_STEPS, MAX_SAFE_STEPS);
+}
+
+
+MotorTestCommand applySafetyLimits(MotorTestCommand cmd) {
+  cmd.targetStepPosition = constrain(cmd.targetStepPosition, MIN_STEPS, MAX_SAFE_STEPS);
+  cmd.speedSPS = constrain(cmd.speedSPS, 0.0f, MAX_SAFE_SPEED_SPS);
+
+  return cmd;
 }
 
 MotorTestCommand buildMotorTestCommand(const PhaseOutput& out) {
@@ -283,7 +385,7 @@ MotorTestCommand buildMotorTestCommand(const PhaseOutput& out) {
       break;
   }
 
-  return cmd;
+  return applySafetyLimits(cmd);
 }
 
 void runMotorTestFromPhase(const PhaseOutput& out) {
@@ -313,10 +415,21 @@ void setup() {
   lastAngleDeg = 0.0f;
 
   Serial.println("Bench gait-phase motor test started");
+
+  userWeightKg = recordUserWeight();
 }
 
 void loop() {
   SensorData s = readSensors();
+
+  if (s.pressureRaw > 1000) {
+    emergencyStop();
+
+    while (true) {
+      delay(100);
+    }
+  }
+
   PhaseOutput out = computePhaseOutput(s);
 
   runMotorTestFromPhase(out);
@@ -334,24 +447,39 @@ void loop() {
     lastPhase = out.phase;
   }
 
-  Serial.print("load=");
+  Serial.print("rawPressure=");
+  Serial.print(s.pressureRaw);
+
+  Serial.print(", load=");
   Serial.print(s.footLoadNorm, 3);
+
+  Serial.print(", userWeightKg=");
+  Serial.print(userWeightKg, 2);
+
   Serial.print(", angle=");
   Serial.print(s.shankAngleDeg, 2);
+
   Serial.print(", vel=");
   Serial.print(s.shankVelDegPerSec, 2);
+
   Serial.print(", phase=");
   Serial.print(phaseToString(out.phase));
+
   Serial.print(", motorMode=");
   Serial.print(activeCmd.modeLabel);
+
   Serial.print(", targetDeg=");
   Serial.print(out.theoreticalKneeAngleDeg, 1);
+
   Serial.print(", cmdSteps=");
   Serial.print(activeCmd.targetStepPosition);
+
   Serial.print(", cmdSPS=");
   Serial.print(activeCmd.speedSPS, 1);
+
   Serial.print(", currentSteps=");
   Serial.print(cs);
+
   Serial.print(", targetSteps=");
   Serial.println(ts);
 
